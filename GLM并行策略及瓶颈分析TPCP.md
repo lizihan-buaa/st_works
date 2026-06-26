@@ -1,6 +1,6 @@
 # DSA/NSA TP+CP 并行策略说明
 
-本文重新按 **Megatron Sequence Parallel (SP) + Tensor Parallel (TP)** 的视角解释技术文档中的 `TP+CP`。这里的 `CP` 在长 prefill 场景中更接近 sequence/context 维度的 activation 分片；文档里的第三个 AllGather 和最后的 ReduceScatter 应按 Megatron SP 的通信语义理解。
+本文按 **Megatron Sequence Parallel (SP) + Tensor Parallel (TP)** 的视角解释技术文档中的 `TP+CP`。这里的 `CP` 在长 prefill 场景中更接近 sequence/context 维度的 activation 分片；文档里的第三个 AllGather 和最后的 ReduceScatter 应按 Megatron SP 的通信语义理解。
 
 ## 1. 应用场景和适用模型
 
@@ -166,7 +166,7 @@ GPU1: Y_full(token1, token9, ...)
 
 这就是 Megatron SP 中 `AllGather -> TP compute -> ReduceScatter` 的模式。
 
-## 3. 通信算子和张量含义
+## 3. 通信算子、生产者和消费者
 
 `prefill_100k_cptp.pdf` 中一层 prefill 的主要通信序列是：
 
@@ -177,30 +177,99 @@ AllGather #3
 ReduceScatter
 ```
 
-另外 trace 中可见 `sglang::cross_device_reduce_2stage<bf16>`，它属于 TP partial output reduce 的实现细节或优化路径。
-
 设：
 
 ```text
-P = 8
+P = 8                       # TP/CP world size
 L = prefill token 数
 n = L / P
-X_r = rank r 持有的 sequence shard，约 [n, hidden]
+r = 当前 rank
+X_r = X[token_i where i % P = r]
 ```
 
-### AllGather #1：汇聚 DSA/NSA indexer/cache 数据
-
-出现位置大致在：
+在 `round-robin-split` 下，每张卡持有交错 token：
 
 ```text
-fast_hadamard_transform
-AllGather
-fused_store_indexer_cache
-fp8_mqa_logits
-topk_transform_prefill
+GPU0: token 0, 8, 16, ...
+GPU1: token 1, 9, 17, ...
+...
+GPU7: token 7, 15, 23, ...
 ```
 
-通信前：
+NCCL AllGather 的原始输出通常是 rank 顺序拼接：
+
+```text
+[rank0 tokens][rank1 tokens]...[rank7 tokens]
+```
+
+SGLang 的 CP helper 会再做 rerange，把它恢复成原始 token 顺序：
+
+```text
+token0, token1, token2, ..., tokenL-1
+```
+
+所以后文的 `AllGather(...)` 都默认包含这个 round-robin rerange。
+
+### AllGather #1：DSA/NSA indexer 全局视图
+
+trace 中大致位置是：
+
+```text
+elementwise
+fast_hadamard_transform_kernel
+fast_hadamard_transform_kernel
+ncclDevKernel_AllGather_RING_LL
+_act_quant_kernel
+fused_store_indexer_cache
+deep_gemm sm100_bf16_gemm_impl
+triton_poi_fused_mul_unsqueeze
+_get_k_and_s_triton_kernel
+deep_gemm sm100_fp8_mqa_logits
+topk_transform_prefill_kernel
+```
+
+这个 AllGather 不是 SP，也不是最终 attention 的 KV AllGather。它服务于 DSA/NSA indexer，用来让每张卡得到全局 token 的 indexer/cache 视图，从而为自己的 query token 选择 sparse KV 范围。
+
+#### 通信前谁生产
+
+生产者是每张卡本地的 attention/indexer 前置算子。
+
+每张卡先从自己的 sequence shard 计算 latent：
+
+```text
+qkv_latent_r = X_r W_a
+q_lora_r, latent_cache_r = split(qkv_latent_r)
+latent_cache_r = [kv_lora_r, k_rope_raw_r]
+```
+
+其中 `q_lora_r` 进入两条路径：
+
+```text
+1. attention query 路径：
+   q_lora_r -> q_a_layernorm -> q_b_proj -> Q_r
+
+2. DSA/NSA indexer 路径：
+   X_r, q_lora_r, position_r -> indexer precompute
+```
+
+第一个 AllGather 前的 elementwise 和 `fast_hadamard_transform_kernel` 可以理解为 indexer 路径的前置变换。抽象写作：
+
+```text
+I_r = f_indexer_pre(X_r, q_lora_r, position_r)
+```
+
+这里的 `I_r` 不是模型里正式命名的单一张量，而是 indexer query/key/cache 写入前需要的中间表示。它可能包含或参与生成：
+
+```text
+indexer query feature
+indexer key feature
+position/rope 相关特征
+后续量化和 cache 写入需要的局部状态
+```
+
+#### 通信内容
+
+第一个 AllGather 通信的是每张卡本地生成的 indexer 前置中间表示：
 
 ```text
 GPU0: I(token0, token8, token16, ...)
@@ -209,172 +278,416 @@ GPU1: I(token1, token9, token17, ...)
 GPU7: I(token7, token15, token23, ...)
 ```
 
-这里 `I` 是 DSA/NSA indexer、top-k、indexer cache 相关中间数据。
-
-通信后，每张卡获得全局 token 视图：
+通信后每张卡都有：
 
 ```text
-GPU0..7: I_full = I(token0, token1, ..., tokenL-1)
+I_full = I(token0, token1, ..., tokenL-1)
 ```
 
-NCCL AllGather 原始结果是按 rank 拼接的，所以 SGLang 会做 reshape/transpose，把 `[rank0][rank1]...` 恢复成原始 token 顺序。
+#### 通信后谁消费
 
-### AllGather #2：汇聚 KV / latent KV cache
-
-出现位置大致在：
+消费者是 DSA/NSA indexer 后续算子：
 
 ```text
-topk_transform_prefill
-rope
-AllGather
-set_mla_kv_buffer
-concat_mla_absorb_q
+_act_quant_kernel
+fused_store_indexer_cache
+deep_gemm sm100_bf16_gemm_impl
+triton_poi_fused_mul_unsqueeze
+_get_k_and_s_triton_kernel
+deep_gemm sm100_fp8_mqa_logits
+topk_transform_prefill_kernel
+```
+
+它们完成的计算可以拆成：
+
+```text
+1. _act_quant_kernel
+   把 indexer query/key 或相关激活量化成 FP8。
+
+2. fused_store_indexer_cache
+   把全局 token 顺序下的 indexer key 写入 indexer cache。
+
+3. deep_gemm sm100_bf16_gemm_impl
+   计算 indexer 的 dense 投影、gate、score 前置项等。
+
+4. triton_poi_fused_mul_unsqueeze / _get_k_and_s_triton_kernel
+   生成 DSA/NSA sparse selection 需要的 key、scale、metadata。
+
+5. deep_gemm sm100_fp8_mqa_logits
+   用本 rank query 对全局 indexer cache 算 logits。
+
+6. topk_transform_prefill_kernel
+   从 logits 里得到每个 query token 要访问的 top-k KV block/token index。
+```
+
+最终产物是 sparse attention 需要的选择结果：
+
+```text
+topk_indices_r = TopK(IndexerLogits(Q_index_r, K_index_full))
+```
+
+注意消费者只需要为本 rank 的 query token 产生 `topk_indices_r`，但它必须能看到全局 indexer cache，所以需要 AllGather #1。
+
+### AllGather #2：MLA/DSA attention 的 latent KV cache
+
+trace 中大致位置是：
+
+```text
+topk_transform_prefill_kernel
+Memcpy DtoD
+GEMM / fused_rope_kernel
+elementwise
+ncclDevKernel_AllGather_RING_LL
+elementwise
+set_mla_kv_buffer_kernel
+concat_mla_absorb_q_kernel
 sparse_attn_fwd_kernel
 ```
 
-通信前：
+这个 AllGather 通信的是真正给 attention 消费的 latent KV cache，而不是第一个 AllGather 的 indexer 中间表示。
+
+#### 通信前谁生产
+
+生产者是本地 KV latent 处理路径。
+
+从前面的投影得到：
 
 ```text
-GPU0: KV(token0, token8, token16, ...)
-GPU1: KV(token1, token9, token17, ...)
+latent_cache_r = [kv_lora_r, k_rope_raw_r]
+```
+
+本地计算：
+
+```text
+k_nope_r = RMSNorm(kv_lora_r)
+k_pe_r   = RoPE(k_rope_raw_r)
+```
+
+然后打包回 latent cache：
+
+```text
+KV_latent_r = concat(k_nope_r, k_pe_r)
+```
+
+代码逻辑上对应 `rebuild_cp_kv_cache`：先把本 rank 的 `k_nope` 和 `k_pe` 写入 `latent_cache`，再调用 CP AllGather。
+
+#### 通信内容
+
+第二个 AllGather 通信的是 attention 用的 latent KV cache：
+
+```text
+GPU0: KV_latent(token0, token8, token16, ...)
+GPU1: KV_latent(token1, token9, token17, ...)
 ...
-GPU7: KV(token7, token15, token23, ...)
+GPU7: KV_latent(token7, token15, token23, ...)
 ```
 
-通信后：
+通信后每张卡都有：
 
 ```text
-GPU0..7: KV_full = KV(token0, token1, ..., tokenL-1)
+KV_latent_full = KV_latent(token0, token1, ..., tokenL-1)
 ```
 
-这一步的目的是让每张卡都能访问完整 KV/cache。随后每张卡只用自己的 `Q_r` attend 到全局 `KV_full`：
+其中可以理解为：
 
 ```text
-GPU r:
-  A_r = SparseAttention(Q_r, KV_full)
+KV_latent_full = [K_nope_full, K_pe_full]
 ```
 
-所以注意力输出仍是本 rank 的 sequence shard。
+#### 通信后谁消费
 
-### AllGather #3：Megatron SP 风格的 activation AllGather
+消费者是 MLA sparse attention 前后的算子：
 
-出现位置大致在：
+```text
+set_mla_kv_buffer_kernel
+concat_mla_absorb_q_kernel
+sparse_attn_fwd_kernel
+```
+
+具体计算是：
+
+```text
+1. set_mla_kv_buffer_kernel
+   把 AllGather 后的 KV_latent_full 写入 MLA KV buffer。
+
+2. concat_mla_absorb_q_kernel
+   拼接本 rank 的 q_nope / q_pe，形成本 rank query。
+
+3. sparse_attn_fwd_kernel
+   用本 rank 的 Q_r、全局 KV_latent_full，以及 AllGather #1 后产生的 topk_indices_r 做 sparse attention。
+```
+
+因此每张卡计算的是：
+
+```text
+O_r = SparseAttention(Q_r, KV_latent_full, topk_indices_r)
+```
+
+这里的关键点是：
+
+```text
+Q_r: 只包含本 rank 的 query token
+KV_latent_full: 包含全局 token 的 KV/cache
+topk_indices_r: 只对应本 rank query 的 sparse selection
+```
+
+所以 attention 输出仍然是 sequence-sharded：
+
+```text
+GPU r: O(token_i where i % P = r)
+```
+
+### AllGather #3：SP activation AllGather，给 TP MLP/MoE 消费
+
+trace 中大致位置是：
 
 ```text
 sparse_attn_fwd_kernel
-o_proj
+GEMM / o_proj
 FusedAddRMSNorm
-AllGather
-per_token_group_quant
-MLP / MoE routing / GEMM / finalize
+ncclDevKernel_AllGather_RING_LL
+per_token_group_quant_fp8
+deep_gemm sm100_fp8_gemm_1d1d_impl
+moe::dev::routing::routingDeepSeek::routingMainKernel
+moe::dev::routing::routingDeepSeek::routingIndicesCluster
+moe::dev::activation::activationDeepSeekKernel
+moe::dev::finalize::finalizeKernel
 ```
 
-这一步不是 DSA cache 汇聚，而是 TP+SP 主干通信。
+这个 AllGather 和前两个不同。它不是 DSA/NSA cache 通信，而是 Megatron SP 语义：把 sequence-sharded activation 聚成 full sequence activation，供 TP 切分的 MLP/MoE 权重使用。
 
-通信前，attention 后的 hidden 是 sequence-sharded：
+#### 通信前谁生产
+
+生产者是 attention 输出后的残差和 norm 路径：
 
 ```text
-GPU0: H(token0, token8, ...)
-GPU1: H(token1, token9, ...)
+O_r = SparseAttention(Q_r, KV_latent_full, topk_indices_r)
+H_r = RMSNorm(residual_r + O_r W_O)
+```
+
+在这套 DSA/NSA CP 路径里，attention 权重基本复制，`W_O` 也不按 8 卡 TP 切 head，所以 `H_r` 仍然只包含本 rank 的 token shard。
+
+#### 通信内容
+
+第三个 AllGather 通信的是 MLP/MoE 输入 activation：
+
+```text
+GPU0: H(token0, token8, token16, ...)
+GPU1: H(token1, token9, token17, ...)
 ...
-GPU7: H(token7, token15, ...)
+GPU7: H(token7, token15, token23, ...)
 ```
 
-MLP/MoE 权重按 TP/MoE 分片。为了让每个 TP rank 用自己的权重分片处理完整 sequence activation，需要先 AllGather：
+通信后每张卡都有：
 
 ```text
-GPU0..7: H_full = H(token0, token1, ..., tokenL-1)
+H_full = H(token0, token1, ..., tokenL-1)
 ```
 
-然后各卡计算：
+#### 通信后谁消费
+
+消费者是 TP 切分的 MLP/MoE。
+
+对于普通 SwiGLU MLP，完整公式是：
 
 ```text
-Y_r_partial = MLP_or_MoE_r(H_full)
+U = H_full W_up
+G = H_full W_gate
+A = SiLU(G) * U
+Y = A W_down
 ```
 
-这里 `r` 是 TP rank 的 partial contribution，不应主要理解成 EP 后的专家贡献汇总。
-
-### ReduceScatter：TP reduce + SP scatter
-
-出现位置大致在：
+TP=8 时，权重按 intermediate 维度切：
 
 ```text
-MoE finalize
-ReduceScatter_Sum_bf16
+W_up_i   = W_up[:,   i*D/P : (i+1)*D/P]
+W_gate_i = W_gate[:, i*D/P : (i+1)*D/P]
+W_down_i = W_down[i*D/P : (i+1)*D/P, :]
 ```
 
-通信前：
+第 `i` 张卡消费 `H_full`，计算自己的 partial output：
 
 ```text
-GPU0: Y_0_partial(full sequence)
-GPU1: Y_1_partial(full sequence)
+U_i = H_full W_up_i              # [L, D/P]
+G_i = H_full W_gate_i            # [L, D/P]
+A_i = SiLU(G_i) * U_i            # [L, D/P]
+Y_i_partial = A_i W_down_i       # [L, H]
+```
+
+对 MoE 层，`H_full` 还会先被 router 消费：
+
+```text
+router_logits = H_full W_router
+expert_ids, expert_weights = TopK(router_logits)
+```
+
+trace 中对应：
+
+```text
+moe::dev::routing::routingDeepSeek::routingMainKernel
+moe::dev::routing::routingDeepSeek::routingIndicesCluster
+```
+
+它们做：
+
+```text
+1. 对每个 token 选择 top-k expert
+2. 生成 token -> expert 的映射
+3. 把 token 按 expert 聚类/重排
+4. 生成 grouped GEMM 所需 metadata
+```
+
+随后 expert FFN 计算：
+
+```text
+U_e_i = X_e W_up_e_i
+G_e_i = X_e W_gate_e_i
+A_e_i = SiLU(G_e_i) * U_e_i
+Y_e_i_partial = A_e_i W_down_e_i
+```
+
+其中 `X_e` 是被路由到 expert `e` 的 token。trace 中的：
+
+```text
+deep_gemm sm100_fp8_gemm_1d1d_impl
+moe::dev::activation::activationDeepSeekKernel
+moe::dev::finalize::finalizeKernel
+```
+
+分别对应 expert GEMM、SwiGLU 激活、expert 输出按 router weight 加权并还原 token 顺序：
+
+```text
+Y_i_partial[token] = sum_{e in topk(token)} alpha[token,e] * Expert_e_i(H_full[token])
+```
+
+这里的 `_i` 表示第 `i` 个 TP rank 的 partial contribution。它还不是最终 MLP/MoE 输出。
+
+### ReduceScatter：TP partial reduce + SP scatter
+
+trace 中大致位置是：
+
+```text
+moe::dev::finalize::finalizeKernel
+ncclDevKernel_ReduceScatter_Sum_bf16
+```
+
+#### 通信前谁生产
+
+生产者是每张 TP rank 上的 MLP/MoE partial output：
+
+```text
+GPU0: Y_0_partial(token0..tokenL-1)
+GPU1: Y_1_partial(token0..tokenL-1)
 ...
-GPU7: Y_7_partial(full sequence)
+GPU7: Y_7_partial(token0..tokenL-1)
 ```
 
-普通 TP 会 AllReduce：
+每个 `Y_i_partial` 形状都是 full sequence：
 
 ```text
-Y_full = sum_r Y_r_partial
+[L, H]
 ```
 
-并让每张卡都拿到完整 `Y_full`。但 SP 不希望保留完整 sequence activation，所以用 ReduceScatter 同时完成两件事：
+但它只是完整 MLP/MoE 输出的一部分。以普通 MLP 为例：
 
 ```text
-1. reduce:  对 TP partial output 求和
-2. scatter: 按 sequence/token 维度切回各 rank
+Y_full = A W_down
+       = A_0 W_down_0 + A_1 W_down_1 + ... + A_7 W_down_7
+       = sum_i Y_i_partial
 ```
 
-通信后：
+MoE 也是同理：每张卡算的是自己的 expert 权重分片贡献，finalize 后仍需要跨 TP rank 求和。
+
+#### 通信内容
+
+ReduceScatter 通信的是所有 TP rank 的 partial output：
 
 ```text
-GPU0: Y_full(token0, token8, ...)
-GPU1: Y_full(token1, token9, ...)
+Y_i_partial: [L, H]
+```
+
+它等价于先 AllReduce 求和，再按 sequence 维度 scatter：
+
+```text
+Y_full = sum_i Y_i_partial
+Y_r = Y_full[token_j where j % P = r]
+```
+
+#### 通信后谁消费
+
+通信后的消费者是下一层 Transformer block 的 attention/indexer 前置计算。
+
+ReduceScatter 后每张卡重新只持有自己的 sequence shard：
+
+```text
+GPU0: Y(token0, token8, token16, ...)
+GPU1: Y(token1, token9, token17, ...)
 ...
-GPU7: Y_full(token7, token15, ...)
+GPU7: Y(token7, token15, token23, ...)
 ```
 
-这一步把 activation 恢复成下一层需要的 CP/SP-local 布局。
+下一层从：
+
+```text
+X_r_next = Y_r
+```
+
+继续重复：
+
+```text
+local attention/indexer precompute
+AllGather #1
+AllGather #2
+local sparse attention
+AllGather #3
+TP MLP/MoE
+ReduceScatter
+```
 
 ## 4. 一层的完整分布式逻辑
 
-按现在的理解，一层 DSA/NSA TP+CP prefill 可以概括为：
+按“生产者 -> 通信 -> 消费者”的方式，一层 DSA/NSA TP+CP prefill 可以概括为：
 
 ```text
-1. 输入 activation 是 sequence-sharded：
-   GPU r 持有 token r::8
+1. 输入布局
+   GPU r 持有 X_r = X[token_i where i % 8 = r]
 
-2. Attention 权重基本复制：
-   每张卡用完整 W_Q/W_KV/W_O 处理自己的 token shard
+2. 本地 attention/indexer 前置计算
+   生产 Q_r、latent_cache_r、indexer precompute I_r
 
-3. AllGather #1：
-   汇聚 DSA/NSA indexer/top-k/cache 相关数据
+3. AllGather #1
+   通信 I_r
+   消费者：indexer quant/cache/logits/topk
+   产物：topk_indices_r
 
-4. AllGather #2：
-   汇聚 KV / latent KV cache
-   每张卡拿到 KV_full，但只计算自己的 Q_r
+4. 本地 KV latent 处理
+   生产 KV_latent_r = [k_nope_r, k_pe_r]
 
-5. Sparse attention：
-   GPU r 计算 SparseAttention(Q_r, KV_full)
-   输出仍是 token r::8
+5. AllGather #2
+   通信 KV_latent_r
+   消费者：set_mla_kv_buffer、concat_q、sparse_attn
+   产物：O_r
 
-6. AllGather #3：
-   按 Megatron SP 逻辑，把 sequence-sharded hidden 聚成 H_full
+6. attention 输出和 norm
+   生产 H_r = RMSNorm(residual_r + O_r W_O)
 
-7. TP MLP/MoE：
-   每张卡用自己的 MLP/MoE 权重分片计算 Y_r_partial(H_full)
+7. AllGather #3
+   通信 H_r
+   消费者：TP MLP/MoE router、expert GEMM、activation、finalize
+   产物：Y_i_partial(full sequence)
 
-8. ReduceScatter：
-   sum 所有 TP partial output，并按 sequence 维度切回 token r::8
-
-9. 下一层继续从 sequence-sharded activation 开始
+8. ReduceScatter
+   通信 Y_i_partial
+   做 sum_i Y_i_partial，并按 token 维度 scatter
+   产物：下一层输入 X_r_next
 ```
 
 一句话总结：
 
 ```text
-前两个 AllGather 是 DSA/NSA 为了恢复全局 cache/KV 视图；
-第三个 AllGather + ReduceScatter 是 Megatron SP 风格的 TP activation 通信对。
+前两个 AllGather 是 DSA/NSA 的 indexer/cache/KV 全局视图；
+第三个 AllGather 是 SP activation AllGather；
+ReduceScatter 是 TP partial output 求和 + SP sequence scatter。
 ```
 
 ## 5. Trace 中观察到的瓶颈
