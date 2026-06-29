@@ -690,7 +690,236 @@ ReduceScatter
 ReduceScatter 是 TP partial output 求和 + SP sequence scatter。
 ```
 
-## 5. Trace 中观察到的瓶颈
+## 5. 实验数据及分析
+
+本节整理 `GLM-5-FP8 CP缓存命中吞吐性能分析优化.pdf` 中的三张性能汇总表。核心指标是：
+
+```text
+Prefill TPS: prefill 阶段 token 吞吐，越高越好
+TTFT: time to first token，首 token 延迟，越低越好
+```
+
+### 5.1 测试并行策略
+
+| 并行策略 | KV Cache 数据类型 | chunked-prefill-size | 总请求数 | 并发 | Prefill TPS | TTFT ms |
+|---|---:|---:|---:|---:|---:|---:|
+| TP + CP 默认 | bf16 | 65536 | 10 | 1 | 107670.66 | 965.30 |
+| TP 默认 | bf16 | 65536 | 10 | 1 | 113225.52 | 917.76 |
+| TP | fp8_e4m3 | 65536 | 10 | 1 | 126931.61 | 818.59 |
+| TP | fp8_e4m3 | 32128 | 10 | 1 | 138595.98 | 749.76 |
+| TP + CP 默认 | bf16 | 65536 | 10 | 10 | 251816.41 | 3683.10 |
+| TP 默认 | bf16 | 65536 | 10 | 10 | 250918.34 | 3700.30 |
+| TP | fp8_e4m3 | 65536 | 10 | 10 | 260986.88 | 3476.53 |
+| TP | fp8_e4m3 | 32128 | 10 | 10 | 251466.52 | 3636.31 |
+
+实验结论：
+
+1. 单并发下，`TP + CP` 比纯 `TP` 略慢。
+
+   在 `bf16 KV cache + chunked-prefill-size=65536` 下：
+
+   ```text
+   TP + CP: 107670.66 TPS, 965.30 ms
+   TP:      113225.52 TPS, 917.76 ms
+   ```
+
+   `TP + CP` 的 TPS 低约 `4.9%`，TTFT 高约 `5.2%`。原因是单请求时 CP/SP 的通信开销不能被充分摊薄。每层的 DSA/NSA cache/KV AllGather、SP activation AllGather 和 ReduceScatter 都会进入关键路径。
+
+2. 10 并发下，`TP + CP` 与纯 `TP` 基本持平。
+
+   ```text
+   TP + CP: 251816.41 TPS, 3683.10 ms
+   TP:      250918.34 TPS, 3700.30 ms
+   ```
+
+   TPS 差异只有约 `0.36%`，TTFT 也基本一致。说明并发升高后，GPU 利用率提高，通信开销被 batch、调度和计算重叠部分摊薄。
+
+3. `fp8_e4m3 KV cache` 对纯 TP 有稳定收益。
+
+   单并发下：
+
+   ```text
+   TP bf16:     113225.52 TPS, 917.76 ms
+   TP fp8 64K: 126931.61 TPS, 818.59 ms
+   TP fp8 32K: 138595.98 TPS, 749.76 ms
+   ```
+
+   `fp8_e4m3` 相比 `bf16`，TPS 提升约 `12.1%`，TTFT 降低约 `10.8%`。说明 KV cache 访存带宽和 cache footprint 对 prefill TTFT 有明显影响。
+
+4. `chunked-prefill-size` 的最优值依赖并发。
+
+   单并发时，`32128` 比 `65536` 更好：
+
+   ```text
+   fp8 32128 / fp8 65536 TPS 比值约 1.09
+   TTFT 比值约 0.92
+   ```
+
+   但 10 并发时，`32128` 反而略差：
+
+   ```text
+   fp8 65536: 260986.88 TPS, 3476.53 ms
+   fp8 32128: 251466.52 TPS, 3636.31 ms
+   ```
+
+   较小 chunk 能改善单请求响应，但高并发下可能增加调度次数、chunk 边界开销，或者降低大 batch GEMM/attention 的效率。
+
+### 5.2 测试 KV Cache 复用：CP + TP
+
+| KV 是否复用 | 测试集 | 总请求数 | 并发 | Prefill TPS | TTFT ms |
+|---|---|---:|---:|---:|---:|
+| 是 | generated-shared-prefix | 1 | 1 | 113537.41 | 905.77 |
+| 是 | generated-shared-prefix | 10 | 1 | 114672.45 | 907.05 |
+| 是 | generated-shared-prefix | 10 | 10 | 255702.61 | 3566.15 |
+| 否 | generated-shared-prefix | 10 | 1 | 31133.77 | 3345.93 |
+| 否 | generated-shared-prefix | 10 | 10 | 33823.84 | 17881.74 |
+| 否 | random-ids | 10 | 1 | 29453.43 | 3393.48 |
+| 否 | random-ids | 10 | 10 | 30859.36 | 18603.47 |
+| 是 | random-ids | 1 | 1 | 115231.81 | 856.28 |
+| 是 | random-ids | 10 | 1 | 30468.08 | 3280.61 |
+| 是 | random-ids | 10 | 10 | 211180.84 | 3950.76 |
+
+实验结论：
+
+1. 在共享前缀数据集上，KV cache 复用收益非常明显。
+
+   `generated-shared-prefix`、10 请求 1 并发：
+
+   ```text
+   复用:   114672.45 TPS, 907.05 ms
+   不复用: 31133.77 TPS, 3345.93 ms
+   ```
+
+   吞吐提升约 `3.68x`，TTFT 降到约 `27%`。10 并发下收益更大：
+
+   ```text
+   复用:   255702.61 TPS, 3566.15 ms
+   不复用: 33823.84 TPS, 17881.74 ms
+   ```
+
+   吞吐提升约 `7.56x`，TTFT 降到约 `20%`。
+
+2. `random-ids` 场景下，单并发的 cache 复用收益很弱。
+
+   ```text
+   不复用: 29453.43 TPS, 3393.48 ms
+   复用:   30468.08 TPS, 3280.61 ms
+   ```
+
+   TPS 只提升约 `3.4%`。这说明 random-ids 没有稳定共享前缀，radix cache 很难产生大规模命中。表里虽然标记了 “KV 是否复用=是”，但实际可复用内容有限。
+
+3. `CP + TP` 在 random-ids 的 10 并发下仍然表现出强 prefill 并行化收益。
+
+   ```text
+   random-ids 不复用 10 并发: 30859.36 TPS, 18603.47 ms
+   random-ids 复用 10 并发:   211180.84 TPS, 3950.76 ms
+   ```
+
+   这里的提升不应简单归因于共享前缀 cache 命中，更可能来自请求调度、chunk/batch 形态、cache 管理路径和 CP 对长上下文 prefill 的并行化共同作用。由于 random-ids 缺少共享前缀，需要结合 cache hit 日志进一步确认真实命中率。
+
+4. 对 `CP + TP` 来说，共享前缀命中后的性能上限大约在 `115K TPS` 单并发、`255K TPS` 10 并发。
+
+   单并发下 1 请求和 10 请求结果接近：
+
+   ```text
+   1 请求 1 并发:  113537.41 TPS, 905.77 ms
+   10 请求 1 并发: 114672.45 TPS, 907.05 ms
+   ```
+
+   说明 cache 命中稳定后，单请求路径的 TTFT 已经比较稳定，额外请求数量本身不会显著改变单并发延迟。
+
+### 5.3 测试 KV Cache 复用：TP
+
+| KV 是否复用 | 测试集 | 总请求数 | 并发 | Prefill TPS | TTFT ms |
+|---|---|---:|---:|---:|---:|
+| 是 | generated-shared-prefix | 1 | 1 | 129822.70 | 792.02 |
+| 是 | generated-shared-prefix | 10 | 1 | 124658.37 | 832.52 |
+| 是 | generated-shared-prefix | 10 | 10 | 237340.88 | 3731.52 |
+| 否 | generated-shared-prefix | 10 | 1 | 8979.58 | 11593.49 |
+| 否 | generated-shared-prefix | 10 | 10 | 8711.17 | 68601.21 |
+| 否 | random-ids | 10 | 1 | 8577.03 | 11657.49 |
+| 否 | random-ids | 10 | 10 | 8447.92 | 68375.60 |
+| 是 | random-ids | 1 | 1 | 121896.41 | 809.06 |
+| 是 | random-ids | 10 | 1 | 9537.35 | 10483.28 |
+| 是 | random-ids | 10 | 10 | 9646.96 | 52356.37 |
+
+实验结论：
+
+1. 纯 TP 在共享前缀 cache 命中时单并发表现最好。
+
+   ```text
+   TP 共享前缀复用，10 请求 1 并发:      124658.37 TPS, 832.52 ms
+   CP + TP 共享前缀复用，10 请求 1 并发: 114672.45 TPS, 907.05 ms
+   ```
+
+   纯 TP 的 TPS 高约 `8.7%`，TTFT 低约 `8.2%`。原因是共享前缀命中后，真正需要计算的新 token 很少，此时 CP 的 sequence split 和跨 rank 通信收益不足，反而增加开销。
+
+2. 纯 TP 在不复用 KV cache 的长上下文 prefill 下非常慢。
+
+   `generated-shared-prefix`、10 请求 1 并发：
+
+   ```text
+   复用:   124658.37 TPS, 832.52 ms
+   不复用: 8979.58 TPS, 11593.49 ms
+   ```
+
+   吞吐提升约 `13.9x`，TTFT 降到约 `7.2%`。10 并发下差距更大：
+
+   ```text
+   复用:   237340.88 TPS, 3731.52 ms
+   不复用: 8711.17 TPS, 68601.21 ms
+   ```
+
+   吞吐提升约 `27.2x`，TTFT 降到约 `5.4%`。这说明纯 TP 对长 prefill 的依赖很重，cache 命中是纯 TP 能保持低 TTFT 的关键。
+
+3. random-ids 下，纯 TP 的 “复用” 基本不能带来有效共享前缀收益。
+
+   ```text
+   random-ids 不复用，10 请求 1 并发: 8577.03 TPS, 11657.49 ms
+   random-ids 复用，10 请求 1 并发:   9537.35 TPS, 10483.28 ms
+   ```
+
+   提升只有约 `11.2%`。10 并发时也只有约 `14.2%` 的 TPS 提升。random-ids 本身不构造公共前缀，因此 radix cache 难以命中大量历史 KV。
+
+4. 在 random-ids 长上下文场景下，`CP + TP` 远强于纯 TP。
+
+   `random-ids`、10 请求 1 并发：
+
+   ```text
+   CP + TP: 30468.08 TPS, 3280.61 ms
+   TP:       9537.35 TPS, 10483.28 ms
+   ```
+
+   `CP + TP` 吞吐约为纯 TP 的 `3.19x`，TTFT 约为纯 TP 的 `31.3%`。
+
+   10 并发下差距更大：
+
+   ```text
+   CP + TP: 211180.84 TPS, 3950.76 ms
+   TP:        9646.96 TPS, 52356.37 ms
+   ```
+
+   `CP + TP` 吞吐约为纯 TP 的 `21.9x`，TTFT 约为纯 TP 的 `7.5%`。这正是 CP/SP 对长上下文 prefill 做 sequence 维度并行的价值所在。
+
+### 5.4 汇总判断
+
+1. cache 命中是共享前缀场景的第一性能来源。
+
+   共享前缀命中后，prefill 实际需要处理的新 token 大幅减少，因此 TP 和 CP+TP 都能获得数量级收益。
+
+2. CP+TP 更适合长上下文、不稳定 cache 命中或高并发 prefill。
+
+   当请求没有共享前缀，或者 cache 命中不足时，CP+TP 能把长上下文 prefill 沿 sequence/token 维度拆到多卡上，明显降低 TTFT。
+
+3. 纯 TP 更适合共享前缀高度命中、单并发或短增量 token 场景。
+
+   当只需要处理少量新 token 时，CP 的 AllGather/ReduceScatter 通信开销会显得更重。此时纯 TP 的路径更短，TTFT 更低。
+
+4. fp8 KV cache 和 chunk size 是独立调优维度。
+
+   `fp8_e4m3` 可以降低 KV cache 访存压力；`chunked-prefill-size` 影响单请求延迟和高并发吞吐，需要分别按单并发、10 并发等目标场景测试。
+
+## 6. Trace 中观察到的瓶颈
 
 ### 主要瓶颈
 
@@ -789,7 +1018,7 @@ NCCL GPU kernel end 时间
 
 如果尖峰位置随机，优先排查系统扰动；如果稳定出现在相同 layer/rank，优先排查模型路径、通信顺序和 kernel 调度。
 
-## 6. 简短结论
+## 7. 简短结论
 
 文档里的 `TP+CP` 更准确地说是：
 
