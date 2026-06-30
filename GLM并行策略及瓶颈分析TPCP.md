@@ -690,6 +690,68 @@ ReduceScatter
 ReduceScatter 是 TP partial output 求和 + SP sequence scatter。
 ```
 
+### 4.1 纯 TP 的通信逻辑
+
+作为对照，纯 TP 不切 sequence/token 维度。每张卡都持有完整 activation：
+
+```text
+GPU0..7: X = [L, H]
+```
+
+它切的是 attention heads、projection channel 和 MLP/MoE intermediate 维度。因此每层主路径通常只有两次主要 TP 通信：
+
+```text
+1. Attention o_proj / RowParallel 输出后 AllReduce
+2. MLP/MoE down_proj 或 finalize 输出后 AllReduce
+```
+
+第一处通信来自 attention。每张卡只计算自己的 heads：
+
+```text
+Q_i = X W_Q_i
+K_i = X W_K_i
+V_i = X W_V_i
+A_i = Attention(Q_i, K_i, V_i)
+Y_i_partial = A_i W_O_i          # [L, H]
+```
+
+完整 attention 输出需要对各 TP rank 的 partial output 求和：
+
+```text
+Y_attn = sum_i Y_i_partial
+```
+
+所以 attention 后需要一次 AllReduce 或等价的 `cross_device_reduce`。
+
+第二处通信来自 MLP/MoE。以 SwiGLU MLP 为例：
+
+```text
+W_up_i   = W_up[:,   i*D/P : (i+1)*D/P]
+W_gate_i = W_gate[:, i*D/P : (i+1)*D/P]
+W_down_i = W_down[i*D/P : (i+1)*D/P, :]
+
+U_i = X W_up_i
+G_i = X W_gate_i
+A_i = SiLU(G_i) * U_i
+Z_i_partial = A_i W_down_i       # [L, H]
+```
+
+完整 MLP 输出同样是：
+
+```text
+Z = sum_i Z_i_partial
+```
+
+所以 MLP/MoE 后需要第二次 AllReduce。MoE 层里 routing、expert GEMM、activation、finalize 之后，得到的仍是本 TP rank 的 partial contribution，因此也需要跨 TP rank 求和。
+
+因此如果模型有约 78 层，纯 TP 主干通信量大致是：
+
+```text
+78 layers * 2 AllReduce/layer = 156 次主要 TP reduce
+```
+
+这不包含最后 `lm_head` 或 sampling 阶段可能存在的 vocab-parallel 通信。和 TP+CP 相比，纯 TP 的通信次数更少，但每张卡都要处理完整长序列。
+
 ## 5. 实验数据及分析
 
 本节整理 `GLM-5-FP8 CP缓存命中吞吐性能分析优化.pdf` 中的三张性能汇总表。核心指标是：
@@ -920,6 +982,33 @@ TTFT: time to first token，首 token 延迟，越低越好
    `fp8_e4m3` 可以降低 KV cache 访存压力；`chunked-prefill-size` 影响单请求延迟和高并发吞吐，需要分别按单并发、10 并发等目标场景测试。
 
 ## 6. Trace 中观察到的瓶颈
+
+### 纯 TP 与 TP+CP 的瓶颈对比
+
+两种方案的主要瓶颈不同：
+
+```text
+纯 TP:
+  通信较少，但 sequence 维度不切。
+  瓶颈主要是长上下文 prefill 计算量和 KV/cache 访存压力。
+
+TP + CP:
+  sequence 维度被切开，长 prefill 计算被多卡分摊。
+  瓶颈主要是高频 AllGather/ReduceScatter、rank 到达不均衡和 GPU command queue backpressure。
+```
+
+纯 TP 每层主要是两次 AllReduce，通信路径短。但 100K 级 prefill 时，每张卡都要处理完整 `[L, H]` activation 和完整上下文 cache 访问；如果 KV cache 不能复用，TTFT 会被长序列计算和访存拖高。
+
+TP+CP 每层通信变成：
+
+```text
+AllGather #1: DSA/NSA indexer/cache 全局视图
+AllGather #2: latent KV cache 全局视图
+AllGather #3: SP activation AllGather
+ReduceScatter: TP partial output 求和并切回 sequence shard
+```
+
+它能降低单卡长序列 prefill 压力，但 collective 变多，且 AllGather 位于 attention 和 MLP/MoE 的关键路径上。共享前缀高度命中、只剩少量 new token 时，CP 的通信收益不足，纯 TP 往往更低延迟；random-ids 或 cache 命中不足的长上下文场景下，TP+CP 的 sequence 并行收益会明显放大。
 
 ### 主要瓶颈
 
